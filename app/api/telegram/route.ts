@@ -77,6 +77,29 @@ function shouldSkip(text: string): boolean {
   return false;
 }
 
+function formatError(err: unknown): string {
+  if (err instanceof Anthropic.AuthenticationError) {
+    return "⚠️ ANTHROPIC_API_KEY 인증 실패. Vercel 환경변수를 확인하세요.";
+  }
+  if (err instanceof Anthropic.NotFoundError) {
+    return `⚠️ 모델 '${MODEL}'을 찾을 수 없습니다. ANTHROPIC_MODEL 환경변수를 확인하세요.`;
+  }
+  if (err instanceof Anthropic.PermissionDeniedError) {
+    return `⚠️ API 키 권한 부족: 모델 '${MODEL}'에 접근할 수 없습니다.`;
+  }
+  if (err instanceof Anthropic.RateLimitError) {
+    return "⚠️ API 호출 한도 초과. 잠시 후 다시 시도하세요.";
+  }
+  if (err instanceof Anthropic.BadRequestError) {
+    return `⚠️ 요청 오류 (400): ${err.message.slice(0, 200)}`;
+  }
+  if (err instanceof Anthropic.APIError) {
+    return `⚠️ API 오류 (${err.status}): ${err.message.slice(0, 200)}`;
+  }
+  const message = err instanceof Error ? err.message : String(err);
+  return `⚠️ 번역 실패: ${message.slice(0, 200)}`;
+}
+
 async function translate(input: string): Promise<string> {
   const reply = await anthropic.messages.create({
     model: MODEL,
@@ -130,11 +153,7 @@ export async function POST(req: Request): Promise<Response> {
     }
   } catch (err) {
     console.error("Translation error:", err);
-    await sendTelegram(
-      msg.chat.id,
-      "⚠️ 번역 실패. 잠시 후 다시 시도하세요.",
-      msg.message_id,
-    );
+    await sendTelegram(msg.chat.id, formatError(err), msg.message_id);
   }
 
   return new Response("ok");
@@ -148,6 +167,8 @@ export async function GET(): Promise<Response> {
       model: MODEL,
       allowlist_size: ALLOWED_CHAT_IDS.length,
       webhook_secret_configured: Boolean(WEBHOOK_SECRET),
+      anthropic_key_configured: Boolean(process.env.ANTHROPIC_API_KEY),
+      telegram_token_configured: Boolean(TG_TOKEN),
     }),
     { headers: { "Content-Type": "application/json" } },
   );
