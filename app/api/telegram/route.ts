@@ -1,0 +1,154 @@
+import Anthropic from "@anthropic-ai/sdk";
+
+export const runtime = "nodejs";
+export const maxDuration = 30;
+
+const anthropic = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY,
+});
+
+const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET;
+const MODEL = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-6";
+
+const ALLOWED_CHAT_IDS = (process.env.ALLOWED_CHAT_IDS ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean)
+  .map(Number)
+  .filter((n) => Number.isFinite(n));
+
+const SYSTEM_PROMPT = `당신은 한국 본사와 캄보디아 현장 직원 사이의 실시간 통역사입니다. 베리워즈(Veryworth)라는 회사의 비즈니스 커뮤니케이션을 번역합니다.
+
+규칙:
+1. 입력이 한국어면 → 자연스러운 크메르어(ភាសាខ្មែរ)로 번역
+2. 입력이 크메르어면 → 자연스러운 한국어로 번역
+3. 입력이 영어면 → 한국어와 크메르어 둘 다 번역
+4. 번역 결과만 출력. "번역:", 인용부호, 부연설명 모두 금지
+5. 업무용 톤 유지. 명령은 명령답게, 질문은 질문답게
+6. 회사명·사람 이름·지명 같은 고유명사는 원문 그대로 유지
+7. 숫자·날짜·금액은 정확하게 보존
+8. 영어 입력일 때만 두 언어 동시 출력 형식:
+🇰🇭 [크메르어]
+🇰🇷 [한국어]`;
+
+type TelegramMessage = {
+  message_id: number;
+  text?: string;
+  from?: { is_bot?: boolean };
+  chat: { id: number; type: string };
+};
+
+type TelegramUpdate = {
+  message?: TelegramMessage;
+  edited_message?: TelegramMessage;
+};
+
+async function sendTelegram(
+  chatId: number,
+  text: string,
+  replyTo?: number,
+): Promise<void> {
+  if (!TG_TOKEN) return;
+  const res = await fetch(
+    `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text,
+        reply_to_message_id: replyTo,
+      }),
+    },
+  );
+  if (!res.ok) {
+    console.error("Telegram send failed:", res.status, await res.text());
+  }
+}
+
+function shouldSkip(text: string): boolean {
+  const trimmed = text.trim();
+  if (trimmed.length < 2) return true;
+  // Skip messages with no letters (emoji-only, numbers-only, punctuation-only)
+  if (!/\p{Letter}/u.test(trimmed)) return true;
+  // Skip bot commands like /start, /help
+  if (trimmed.startsWith("/")) return true;
+  return false;
+}
+
+async function translate(input: string): Promise<string> {
+  const reply = await anthropic.messages.create({
+    model: MODEL,
+    max_tokens: 1500,
+    system: SYSTEM_PROMPT,
+    messages: [{ role: "user", content: input }],
+  });
+
+  const textBlock = reply.content.find((b) => b.type === "text");
+  return textBlock && textBlock.type === "text" ? textBlock.text.trim() : "";
+}
+
+export async function POST(req: Request): Promise<Response> {
+  // Verify webhook secret if configured
+  if (WEBHOOK_SECRET) {
+    const got = req.headers.get("x-telegram-bot-api-secret-token");
+    if (got !== WEBHOOK_SECRET) {
+      return new Response("unauthorized", { status: 401 });
+    }
+  }
+
+  let update: TelegramUpdate;
+  try {
+    update = (await req.json()) as TelegramUpdate;
+  } catch {
+    return new Response("bad json", { status: 400 });
+  }
+
+  const msg = update.message ?? update.edited_message;
+  if (!msg?.text) return new Response("ok");
+
+  // Allowlist enforcement (must be set for safety)
+  if (ALLOWED_CHAT_IDS.length === 0) {
+    console.warn("ALLOWED_CHAT_IDS not configured — ignoring all messages");
+    return new Response("ok");
+  }
+  if (!ALLOWED_CHAT_IDS.includes(msg.chat.id)) {
+    return new Response("ok");
+  }
+
+  // Anti-loop: ignore bot messages
+  if (msg.from?.is_bot) return new Response("ok");
+
+  // Cost filter
+  if (shouldSkip(msg.text)) return new Response("ok");
+
+  try {
+    const translated = await translate(msg.text);
+    if (translated) {
+      await sendTelegram(msg.chat.id, translated, msg.message_id);
+    }
+  } catch (err) {
+    console.error("Translation error:", err);
+    await sendTelegram(
+      msg.chat.id,
+      "⚠️ 번역 실패. 잠시 후 다시 시도하세요.",
+      msg.message_id,
+    );
+  }
+
+  return new Response("ok");
+}
+
+export async function GET(): Promise<Response> {
+  return new Response(
+    JSON.stringify({
+      ok: true,
+      bot: "veryworth-translator",
+      model: MODEL,
+      allowlist_size: ALLOWED_CHAT_IDS.length,
+      webhook_secret_configured: Boolean(WEBHOOK_SECRET),
+    }),
+    { headers: { "Content-Type": "application/json" } },
+  );
+}
