@@ -1,7 +1,12 @@
 import Anthropic from "@anthropic-ai/sdk";
+import { after } from "next/server";
+import { formatRunwayError, generateImage, runwayConfigured } from "../../lib/runway";
 
 export const runtime = "nodejs";
-export const maxDuration = 30;
+// Image generation runs after the webhook is acknowledged (see `after` below),
+// but still counts against the function's max duration.
+export const maxDuration = 60;
+const IMAGE_TIMEOUT_MS = 50_000;
 
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
@@ -64,6 +69,62 @@ async function sendTelegram(
   );
   if (!res.ok) {
     console.error("Telegram send failed:", res.status, await res.text());
+  }
+}
+
+async function sendTelegramPhoto(
+  chatId: number,
+  photoUrl: string,
+  caption: string,
+  replyTo?: number,
+): Promise<void> {
+  if (!TG_TOKEN) return;
+  const res = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendPhoto`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      photo: photoUrl,
+      caption: caption.slice(0, 1024),
+      reply_to_message_id: replyTo,
+    }),
+  });
+  if (!res.ok) {
+    console.error("Telegram sendPhoto failed:", res.status, await res.text());
+  }
+}
+
+// Matches "/image prompt" and "/image@YourBot prompt". Returns the prompt
+// (possibly empty) or null when the message is not an /image command.
+function parseImageCommand(text: string): string | null {
+  const m = text.trim().match(/^\/image(?:@\w+)?(?:\s+([\s\S]*))?$/i);
+  return m ? (m[1] ?? "").trim() : null;
+}
+
+async function handleImage(msg: TelegramMessage, prompt: string): Promise<void> {
+  if (!runwayConfigured()) {
+    await sendTelegram(
+      msg.chat.id,
+      "⚠️ RUNWAYML_API_SECRET이 설정되지 않았습니다.",
+      msg.message_id,
+    );
+    return;
+  }
+  if (!prompt) {
+    await sendTelegram(
+      msg.chat.id,
+      "사용법: /image <설명>  (예: /image 앙코르와트 일출, 수채화 스타일)",
+      msg.message_id,
+    );
+    return;
+  }
+  await sendTelegram(msg.chat.id, "🎨 이미지 생성 중...", msg.message_id);
+  try {
+    const url = await generateImage(prompt, IMAGE_TIMEOUT_MS);
+    await sendTelegramPhoto(msg.chat.id, url, prompt, msg.message_id);
+  } catch (err) {
+    console.error("Runway error:", err);
+    await sendTelegram(msg.chat.id, formatRunwayError(err), msg.message_id);
   }
 }
 
@@ -143,6 +204,14 @@ export async function POST(req: Request): Promise<Response> {
   // Anti-loop: ignore bot messages
   if (msg.from?.is_bot) return new Response("ok");
 
+  // /image <prompt>: generate with Runway after acknowledging the webhook,
+  // so Telegram doesn't time out and redeliver while the task runs.
+  const imagePrompt = parseImageCommand(msg.text);
+  if (imagePrompt !== null) {
+    if (update.message) after(() => handleImage(msg, imagePrompt));
+    return new Response("ok");
+  }
+
   // Cost filter
   if (shouldSkip(msg.text)) return new Response("ok");
 
@@ -169,6 +238,7 @@ export async function GET(): Promise<Response> {
       webhook_secret_configured: Boolean(WEBHOOK_SECRET),
       anthropic_key_configured: Boolean(process.env.ANTHROPIC_API_KEY),
       telegram_token_configured: Boolean(TG_TOKEN),
+      runway_key_configured: runwayConfigured(),
     }),
     { headers: { "Content-Type": "application/json" } },
   );
